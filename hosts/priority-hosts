@@ -1,23 +1,23 @@
 # Priority routes for ChatGPT
-37.230.192.51 chatgpt.com
-37.230.192.51 chat.openai.com
-37.230.192.51 api.chatgpt.com
-37.230.192.51 edge.chatgpt.com
-37.230.192.51 auth.openai.com
-37.230.192.51 auth0.openai.com
-37.230.192.51 api.openai.com
-37.230.192.51 cdn.oaistatic.com
-37.230.192.51 oaistatic.com
-37.230.192.51 files.oaiusercontent.com
-37.230.192.51 ios.chat.openai.com
-37.230.192.51 android.chat.openai.com
+95.182.120.241 chatgpt.com
+95.182.120.241 chat.openai.com
+95.182.120.241 api.chatgpt.com
+95.182.120.241 edge.chatgpt.com
+95.182.120.241 auth.openai.com
+95.182.120.241 auth0.openai.com
+95.182.120.241 api.openai.com
+95.182.120.241 cdn.oaistatic.com
+95.182.120.241 oaistatic.com
+95.182.120.241 files.oaiusercontent.com
+95.182.120.241 ios.chat.openai.com
+95.182.120.241 android.chat.openai.com
 
 # Priority routes for Notion
-37.230.192.51 app.notion.com
-37.230.192.51 api.notion.com
-37.230.192.51 notion.com
-37.230.192.51 notion.so
-37.230.192.51 www.notion.com
-37.230.192.51 www.notion.so
-37.230.192.51 calendar.notion.com
-37.230.192.51 calendar.notion.so
+95.182.120.241 app.notion.com
+95.182.120.241 api.notion.com
+95.182.120.241 notion.com
+95.182.120.241 notion.so
+95.182.120.241 www.notion.com
+95.182.120.241 www.notion.so
+95.182.120.241 calendar.notion.com
+95.182.120.241 calendar.notion.so
