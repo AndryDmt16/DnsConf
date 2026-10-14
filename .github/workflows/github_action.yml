@@ -1,40 +1,222 @@
-name: DNS Block&Redirect Configurer cron task
+name: GeoHide NextDNS failover (test mode)
 
+# Schedule will be enabled only after a successful manual test.
 on:
-  schedule:
-    - cron: '30 1 * * *' # 04:30 MSK (01:30 UTC)
   workflow_dispatch:
+    inputs:
+      apply:
+        description: "Apply changes to NextDNS (unchecked = dry run)"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nextdns-rewrites
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     environment: DNS
-
+    timeout-minutes: 120
     env:
       DNS: ${{ vars.DNS }}
       BLOCK: ${{ vars.BLOCK }}
-      REDIRECT: ${{ vars.REDIRECT }}
-
       CLIENT_ID: ${{ secrets.CLIENT_ID }}
       AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
-
+      APPLY: ${{ inputs.apply }}
       TZ: Europe/Moscow
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Verify servers and preview all GeoHide redirects
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import collections
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import urllib.request
+
+          # All three passed TLS checks from the user's Mac on 2026-10-14.
+          # 159.194.200.33 is deliberately excluded: repeated SSL timeouts.
+          CANDIDATES = ["193.233.112.67", "193.233.112.68", "193.233.112.88"]
+          # Known alternatives in GeoHide's 2026-10-14 hosts list.
+          GEOHIDE_IPS = set(CANDIDATES + ["159.194.200.33"])
+          SOURCE_URL = "https://raw.githubusercontent.com/Internet-Helper/GeoHideDNS/refs/heads/main/hosts/hosts"
+          PROBES = {"chatgpt.com": {"200", "301", "302", "307", "308", "403"},
+                    "app.notion.com": {"200", "301", "302", "307", "308"}}
+
+
+          def fetch_text(url):
+              request = urllib.request.Request(url, headers={"User-Agent": "geohide-nextdns-failover/1.0"})
+              with urllib.request.urlopen(request, timeout=25) as response:
+                  return response.read().decode("utf-8")
+
+
+          def route_lines(raw):
+              rows = []
+              for line in raw.splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split()
+                  if len(parts) < 2:
+                      continue
+                  ip, domain = parts[:2]
+                  if ip in {"0.0.0.0", "127.0.0.1", "::1"}:
+                      continue
+                  rows.append((ip, domain))
+              return rows
+
+
+          def query_nextdns():
+              profile = os.environ["CLIENT_ID"]
+              token = os.environ["AUTH_SECRET"]
+              request = urllib.request.Request(
+                  f"https://api.nextdns.io/profiles/{profile}/rewrites",
+                  headers={"X-Api-Key": token, "Accept": "application/json"})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  payload = json.load(response)
+              entries = payload.get("data")
+              if not isinstance(entries, list):
+                  raise RuntimeError("NextDNS API did not return a rewrites list: refusing to apply")
+              return {str(item["name"]): str(item["content"]) for item in entries}
+
+
+          def passes(ip):
+              for host, acceptable_codes in PROBES.items():
+                  for attempt in range(2):
+                      result = subprocess.run([
+                          "curl", "--noproxy", "*", "--http1.1", "--silent", "--show-error",
+                          "--resolve", f"{host}:443:{ip}",
+                          "--connect-timeout", "4", "--max-time", "9",
+                          "--output", "/dev/null", "--write-out", "%{http_code}",
+                          f"https://{host}/"], capture_output=True, text=True, timeout=11)
+                      code = result.stdout.strip()
+                      print(f"Probe {ip} {host} #{attempt+1}: HTTP={code or '000'}", flush=True)
+                      if result.returncode != 0 or code not in acceptable_codes:
+                          return False
+              return True
+
+
+          # Validate the upstream source BEFORE any changes to NextDNS.
+          upstream = route_lines(fetch_text(SOURCE_URL))
+          if len(upstream) < 3500 or len({domain for _, domain in upstream}) < 900:
+              raise RuntimeError("GeoHide hosts list is unexpectedly small; refusing to apply")
+          priority = route_lines(Path("hosts/priority-hosts").read_text(encoding="utf-8"))
+          if len(priority) != 20 or len({domain for _, domain in priority}) != 20:
+              raise RuntimeError("Priority list must contain exactly 20 unique domains; refusing to apply")
+
+          # Test EVERY candidate: healthy servers can be spread across different sites.
+          # Keep current server assignments where possible to prevent rewriting all sites hourly.
+          existing = query_nextdns()
+          healthy = [ip for ip in CANDIDATES if passes(ip)]
+          if not healthy:
+              raise RuntimeError("No GeoHide candidate passed checks. NextDNS was NOT modified")
+          print(f"Healthy GeoHide servers: {', '.join(healthy)}", flush=True)
+          current = existing.get("chatgpt.com", "")
+          selected = current if current in healthy else healthy[0]
+          print(f"Priority domain server: {selected}", flush=True)
+
+
+          def choose_proxy(domain, offered):
+              choices = [ip for ip in healthy if ip in offered]
+              if not choices:
+                  raise RuntimeError(f"No healthy allowed server for {domain}; NextDNS was NOT modified")
+              old = existing.get(domain)
+              if old in choices:
+                  return old
+              # Rendezvous hashing distributes sites across working servers, deterministically.
+              return max(choices, key=lambda ip: hashlib.sha256(f"{domain}|{ip}".encode()).digest())
+
+          # Build exactly one value per domain. Priority-only domains are included,
+          # but their tracked addresses (e.g. old 37.x) are replaced IN MEMORY.
+          desired = collections.OrderedDict()
+          for _, domain in priority:
+              desired[domain] = selected
+
+          # Use the official list of allowed IPs per domain; preserve third-party entries.
+          options = collections.OrderedDict()
+          for ip, domain in upstream:
+              options.setdefault(domain, []).append(ip)
+          for domain, values in options.items():
+              if domain in desired:
+                  continue
+              if any(ip in GEOHIDE_IPS for ip in values):
+                  desired[domain] = choose_proxy(domain, values)
+              else:
+                  # A third-party/non-proxy redirect: NEVER rewrite it to a GeoHide server.
+                  desired[domain] = values[0]
+
+          changed = [(domain, ip, existing.get(domain))
+                     for domain, ip in desired.items() if existing.get(domain) != ip]
+          print(f"Domains in generated list: {len(desired)}", flush=True)
+          print(f"Changes needed: {len(changed)}", flush=True)
+          print(f"Already correct: {len(desired)-len(changed)}", flush=True)
+          print(f"Third-party (non-GeoHide) entries preserved: {sum(1 for v in desired.values() if v not in GEOHIDE_IPS)}", flush=True)
+          for domain, ip, old in changed[:15]:
+              print(f"  {domain}: {old or '(new)'} -> {ip}", flush=True)
+          if len(changed) > 15:
+              print(f"  ... and {len(changed)-15} more", flush=True)
+
+          # A single local hosts source for the existing Java importer.
+          generated_dir = Path(os.environ["RUNNER_TEMP"]) / "geohide-generated"
+          generated_dir.mkdir(parents=True, exist_ok=True)
+          (generated_dir / "hosts").write_text(
+              "# Generated in GitHub Actions, never committed.\n" +
+              "".join(f"{ip} {domain}\n" for domain, ip in desired.items()),
+              encoding="utf-8")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"changes={len(changed)}\n")
+
+          if os.environ.get("APPLY", "false").lower() != "true":
+              print("DRY RUN ONLY: NextDNS was NOT changed. To apply, check the apply box when starting workflow.")
+          else:
+              print("Apply requested. NextDNS update will run in the following step if changes are needed.")
+          PY
+
       - name: Set up JDK 25
+        if: ${{ inputs.apply && steps.prepare.outputs.changes != '0' }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
           cache: maven
 
-      - name: Build with Maven
+      - name: Build Java importer
+        if: ${{ inputs.apply && steps.prepare.outputs.changes != '0' }}
         run: mvn -B clean package
 
-      - name: Run application
+      - name: Update NextDNS redirects
+        if: ${{ inputs.apply && steps.prepare.outputs.changes != '0' }}
+        shell: bash
         run: |
-          echo "Starting application..."
+          set -euo pipefail
+          generated_dir="$RUNNER_TEMP/geohide-generated"
+          test -s "$generated_dir/hosts"
+          # The existing Java application reads URL sources, so expose the generated
+          # source briefly on localhost. No repository files or secrets are changed.
+          python3 -m http.server 8765 --bind 127.0.0.1 \
+            --directory "$generated_dir" > "$generated_dir/server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for i in 1 2 3 4 5; do
+            if curl --noproxy '*' -fsS http://127.0.0.1:8765/hosts -o /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --noproxy '*' -fsS http://127.0.0.1:8765/hosts -o /dev/null
+          export REDIRECT="http://127.0.0.1:8765/hosts"
           java --enable-preview -jar target/*.jar
