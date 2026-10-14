@@ -1,4 +1,4 @@
-name: GeoHide NextDNS failover (test mode)
+name: GeoHide NextDNS failover (test mode, API fix)
 
 # Schedule will be enabled only after a successful manual test.
 on:
@@ -80,13 +80,51 @@ jobs:
 
 
           def query_nextdns():
-              profile = os.environ["CLIENT_ID"]
-              token = os.environ["AUTH_SECRET"]
-              request = urllib.request.Request(
-                  f"https://api.nextdns.io/profiles/{profile}/rewrites",
-                  headers={"X-Api-Key": token, "Accept": "application/json"})
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  payload = json.load(response)
+              import urllib.error
+              import tempfile
+
+              profile = os.environ.get("CLIENT_ID", "").strip()
+              token = os.environ.get("AUTH_SECRET", "").strip()
+              if not profile or not token:
+                  raise RuntimeError("NextDNS CLIENT_ID or AUTH_SECRET is missing in the DNS environment")
+              url = f"https://api.nextdns.io/profiles/{profile}/rewrites"
+              # Match the existing, formerly working Java client's GET headers.
+              headers = {
+                  "X-Api-Key": token,
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+                  "User-Agent": "Java-http-client/25",
+              }
+              try:
+                  request = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      payload = json.load(response)
+              except urllib.error.HTTPError as exc:
+                  print(
+                      f"NextDNS urllib GET: HTTP {exc.code}, "
+                      f"content-type={exc.headers.get('Content-Type', '?')}; trying curl fallback",
+                      flush=True,
+                  )
+                  # Keep API credentials and response bodies out of action logs.
+                  with tempfile.TemporaryDirectory() as tmp:
+                      output_file = Path(tmp) / "nextdns_response.json"
+                      result = subprocess.run([
+                          "curl", "--noproxy", "*", "--http1.1", "--silent", "--show-error",
+                          "--max-time", "30", "--connect-timeout", "10",
+                          "--header", f"X-Api-Key: {token}",
+                          "--header", "Content-Type: application/json",
+                          "--header", "Accept: application/json",
+                          "--output", str(output_file), "--write-out", "%{http_code}",
+                          url,
+                      ], capture_output=True, text=True, timeout=35)
+                      status = result.stdout.strip()
+                      print(f"NextDNS curl GET: HTTP {status or '000'} (exit {result.returncode})", flush=True)
+                      if result.returncode != 0 or status != "200":
+                          raise RuntimeError(
+                              "NextDNS rejected the read request; NO changes made. "
+                              "Check DNS environment secret and API access, not the GeoHide IPs."
+                          )
+                      payload = json.loads(output_file.read_text(encoding="utf-8"))
               entries = payload.get("data")
               if not isinstance(entries, list):
                   raise RuntimeError("NextDNS API did not return a rewrites list: refusing to apply")
